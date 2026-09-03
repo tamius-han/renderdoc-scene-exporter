@@ -1,0 +1,9 @@
+{
+    "extension_api": 1,
+    "name": "RenderDoc Scene Exporter",
+    "version": "0.1",
+    "minimum_renderdoc": "1.45",
+    "author": "Tamius Han",
+    "url": "https://tamius.net",
+    "description": "Exports all geometry, textures, and texture-to-geometry bindings from the loaded capture."
+}
