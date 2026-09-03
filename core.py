@@ -87,65 +87,82 @@ def find_semantic_attrs(attrs):
     return pos_attr, norm_attr, uv_attr
 
 
-def read_attr(controller, vbuffers, attr, max_index):
-    if attr is None or attr.vertexBuffer >= len(vbuffers) or attr.vertexBuffer < 0:
-        return None
-    vb = vbuffers[attr.vertexBuffer]
-    if vb.resourceId == rd.ResourceId.Null():
-        return None
+def compact_indices(indices):
+    """Map a draw's (possibly huge, sparse-in-a-shared-buffer) index values
+    down to a small dense range: only the vertices actually referenced are
+    fetched/decoded/written, and each unique vertex is decoded exactly once
+    no matter how many triangles reuse it.
 
-    comp_size = attr.format.compByteWidth * attr.format.compCount
-    stride = vb.byteStride if vb.byteStride else comp_size
-    base_offset = attr.byteOffset + vb.byteOffset
-    needed = base_offset + stride * max_index
-    data = controller.GetBufferData(vb.resourceId, 0, needed)
+    Returns (unique_sorted_locals, min_index, face_local_indices) where
+    face_local_indices are 0-based positions into unique_sorted_locals,
+    suitable for passing straight to write_obj (which adds 1 for OBJ)."""
+    if not indices:
+        return [], 0, []
+    min_idx = min(indices)
+    locals_ = [i - min_idx for i in indices]
+    unique_locals = sorted(set(locals_))
+    remap = {li: pos for pos, li in enumerate(unique_locals)}
+    face_local_indices = [remap[li] for li in locals_]
+    return unique_locals, min_idx, face_local_indices
 
+
+def read_selected(data, stride, byte_offset_in_vertex, fmt, unique_locals):
+    """Decode one attribute for exactly the vertices in unique_locals, from
+    an already-fetched raw byte window (see fetch_vb_window)."""
+    comp_size = fmt.compByteWidth * fmt.compCount
     out = []
-    for i in range(max_index):
-        base = base_offset + stride * i
+    for li in unique_locals:
+        base = li * stride + byte_offset_in_vertex
         chunk = data[base:base + comp_size]
         if len(chunk) < comp_size:
             out.append(None)
             continue
-        out.append(decode_attribute(chunk, attr.format))
+        out.append(decode_attribute(chunk, fmt))
     return out
 
 
 def write_obj(path, action, positions, normals, uvs, indices, note=None):
-    with open(path, "w") as f:
-        f.write("# eid={}{}\n".format(action.eventId, " - " + note if note else ""))
-        for p in positions:
-            vals = (list(p) + [0, 0, 0])[:3] if p else [0, 0, 0]
-            f.write("v {} {} {}\n".format(*vals))
-        if uvs:
-            for uv in uvs:
-                vals = (list(uv) + [0, 0])[:2] if uv else [0, 0]
-                f.write("vt {} {}\n".format(vals[0], 1.0 - vals[1]))
-        if normals:
-            for n in normals:
-                vals = (list(n) + [0, 0, 1])[:3] if n else [0, 0, 1]
-                f.write("vn {} {} {}\n".format(*vals))
+    lines = ["# eid={}{}\n".format(action.eventId, " - " + note if note else "")]
+    for p in positions:
+        vals = (list(p) + [0, 0, 0])[:3] if p else [0, 0, 0]
+        lines.append("v {} {} {}\n".format(*vals))
+    if uvs:
+        for uv in uvs:
+            vals = (list(uv) + [0, 0])[:2] if uv else [0, 0]
+            lines.append("vt {} {}\n".format(vals[0], 1.0 - vals[1]))
+    if normals:
+        for n in normals:
+            vals = (list(n) + [0, 0, 1])[:3] if n else [0, 0, 1]
+            lines.append("vn {} {} {}\n".format(*vals))
 
-        has_uv, has_n = bool(uvs), bool(normals)
-        tri_count = len(indices) - (len(indices) % 3)
-        for t in range(0, tri_count, 3):
-            face = []
-            for k in range(3):
-                idx = indices[t + k] + 1  # OBJ indices are 1-based
-                if has_uv and has_n:
-                    face.append(f"{idx}/{idx}/{idx}")
-                elif has_uv:
-                    face.append(f"{idx}/{idx}")
-                elif has_n:
-                    face.append(f"{idx}//{idx}")
-                else:
-                    face.append(f"{idx}")
-            f.write("f " + " ".join(face) + "\n")
+    has_uv, has_n = bool(uvs), bool(normals)
+    tri_count = len(indices) - (len(indices) % 3)
+    for t in range(0, tri_count, 3):
+        face = []
+        for k in range(3):
+            idx = indices[t + k] + 1  # OBJ indices are 1-based
+            if has_uv and has_n:
+                face.append(f"{idx}/{idx}/{idx}")
+            elif has_uv:
+                face.append(f"{idx}/{idx}")
+            elif has_n:
+                face.append(f"{idx}//{idx}")
+            else:
+                face.append(f"{idx}")
+        lines.append("f " + " ".join(face) + "\n")
+
+    with open(path, "w") as f:
+        f.write("".join(lines))
 
 
 def export_mesh_for_action(controller, state, action, out_dir, mesh_name):
     """Reads raw input-assembler vertex data for one draw and writes an OBJ.
-    This is the pre-transform (bind pose / object space) geometry."""
+    This is the pre-transform (bind pose / object space) geometry.
+
+    Only fetches the byte window actually referenced by this draw (not the
+    whole buffer from the start), and decodes each unique vertex once even
+    if it's reused by many triangles - important for shared/world-sized
+    vertex and index buffers where a single draw only touches a small slice."""
     if action.numIndices == 0:
         return None
 
@@ -164,26 +181,57 @@ def export_mesh_for_action(controller, state, action, out_dir, mesh_name):
     if use_ib:
         idx_width = ibuf.byteStride if ibuf.byteStride in (1, 2, 4) else 4
         fmt_char = {1: 'B', 2: 'H', 4: 'I'}[idx_width]
-        raw = controller.GetBufferData(ibuf.resourceId, ibuf.byteOffset, 0)
-        offset = action.indexOffset * idx_width
-        indices = list(struct.unpack_from(
-            '<' + fmt_char * action.numIndices, raw, offset))
+        # Fetch exactly this draw's slice of the index buffer, not "from the
+        # start" and not "to the end" - both of which are wasteful (and can
+        # be huge) when many draws share one big index buffer.
+        start = ibuf.byteOffset + action.indexOffset * idx_width
+        length = action.numIndices * idx_width
+        raw = controller.GetBufferData(ibuf.resourceId, start, length)
+        indices = list(struct.unpack_from('<' + fmt_char * action.numIndices, raw, 0))
         # baseVertex is an offset applied on top of each raw index
         indices = [i + action.baseVertex for i in indices]
     else:
         # Non-indexed: vertices are consumed sequentially starting at vertexOffset
         indices = [action.vertexOffset + i for i in range(action.numIndices)]
 
-    max_index = (max(indices) + 1) if indices else 0
-    positions = read_attr(controller, vbuffers, pos_attr, max_index)
-    normals = read_attr(controller, vbuffers, norm_attr, max_index) if norm_attr else None
-    uvs = read_attr(controller, vbuffers, uv_attr, max_index) if uv_attr else None
+    unique_locals, min_idx, face_indices = compact_indices(indices)
+    if not unique_locals:
+        return None
+    count = unique_locals[-1] + 1
+
+    # Fetch each unique vertex buffer's window exactly once, even if
+    # position/normal/uv are all interleaved in the same buffer (the common
+    # case) - and only the window this draw actually uses, not from byte 0.
+    vb_windows = {}
+
+    def get_window(vb):
+        if vb.resourceId not in vb_windows:
+            stride = vb.byteStride if vb.byteStride else 0
+            start = vb.byteOffset + stride * min_idx
+            length = stride * count
+            data = controller.GetBufferData(vb.resourceId, start, length)
+            vb_windows[vb.resourceId] = (data, stride)
+        return vb_windows[vb.resourceId]
+
+    def read_all(attr):
+        if attr is None or attr.vertexBuffer >= len(vbuffers) or attr.vertexBuffer < 0:
+            return None
+        vb = vbuffers[attr.vertexBuffer]
+        if vb.resourceId == rd.ResourceId.Null():
+            return None
+        data, stride = get_window(vb)
+        stride = stride if stride else (attr.format.compByteWidth * attr.format.compCount)
+        return read_selected(data, stride, attr.byteOffset, attr.format, unique_locals)
+
+    positions = read_all(pos_attr)
+    normals = read_all(norm_attr) if norm_attr else None
+    uvs = read_all(uv_attr) if uv_attr else None
 
     if positions is None:
         return None
 
     path = os.path.join(out_dir, mesh_name + ".obj")
-    write_obj(path, action, positions, normals, uvs, indices)
+    write_obj(path, action, positions, normals, uvs, face_indices)
     return path
 
 
@@ -242,20 +290,16 @@ def build_postvs_outputs(vs_refl):
     return outputs, offset
 
 
-def read_postvs_attr(controller, postvs, out_attr, max_index, fallback_stride):
+def read_postvs_selected(data, stride, out_attr, unique_locals):
     ch = vartype_struct_char(out_attr["varType"])
     if ch is None:
         return None
     comp_count = out_attr["compCount"]
     comp_size = out_attr["compByteWidth"] * comp_count
-    stride = postvs.vertexByteStride if postvs.vertexByteStride else fallback_stride
-    base_offset = postvs.vertexByteOffset + out_attr["byteOffset"]
-    needed = base_offset + stride * max_index
-    data = controller.GetBufferData(postvs.vertexResourceId, 0, needed)
-
+    byte_offset = out_attr["byteOffset"]
     out = []
-    for i in range(max_index):
-        base = base_offset + stride * i
+    for li in unique_locals:
+        base = li * stride + byte_offset
         chunk = data[base:base + comp_size]
         if len(chunk) < comp_size:
             out.append(None)
@@ -268,7 +312,9 @@ def get_postvs_indices(controller, postvs):
     if postvs.indexResourceId != rd.ResourceId.Null():
         idx_width = postvs.indexByteStride if postvs.indexByteStride in (1, 2, 4) else 4
         fmt_char = {1: 'B', 2: 'H', 4: 'I'}[idx_width]
-        raw = controller.GetBufferData(postvs.indexResourceId, postvs.indexByteOffset, 0)
+        # Exact-length fetch, not "read to end of buffer".
+        length = postvs.numIndices * idx_width
+        raw = controller.GetBufferData(postvs.indexResourceId, postvs.indexByteOffset, length)
         indices = list(struct.unpack_from('<' + fmt_char * postvs.numIndices, raw, 0))
         return [i + postvs.baseVertex for i in indices]
     return list(range(postvs.numIndices))
@@ -301,7 +347,17 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
         return None
 
     indices = get_postvs_indices(controller, postvs)
-    max_index = (max(indices) + 1) if indices else 0
+    unique_locals, min_idx, face_indices = compact_indices(indices)
+    if not unique_locals:
+        return None
+    count = unique_locals[-1] + 1
+
+    stride = postvs.vertexByteStride if postvs.vertexByteStride else fallback_stride
+    # Single windowed fetch covering only the vertices this draw actually
+    # uses, shared across position/normal/uv (all interleaved in one buffer).
+    window_start = postvs.vertexByteOffset + stride * min_idx
+    window_len = stride * count
+    vb_data = controller.GetBufferData(postvs.vertexResourceId, window_start, window_len)
 
     # outputs[0] is always the builtin clip-space position (SV_Position /
     # gl_Position). If the shader ALSO passes through a separate, named
@@ -324,10 +380,10 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
             uv_attr = o
 
     if alt_pos_attr is not None:
-        raw_positions = read_postvs_attr(controller, postvs, alt_pos_attr, max_index, fallback_stride)
+        raw_positions = read_postvs_selected(vb_data, stride, alt_pos_attr, unique_locals)
         positions = [p[:3] if p else None for p in raw_positions] if raw_positions else None
     else:
-        raw_positions = read_postvs_attr(controller, postvs, clip_pos_attr, max_index, fallback_stride)
+        raw_positions = read_postvs_selected(vb_data, stride, clip_pos_attr, unique_locals)
         positions = None
         if raw_positions:
             # No separate world/view-space output exists, so reconstruct an
@@ -355,13 +411,13 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
     if not positions:
         return None
 
-    normals = read_postvs_attr(controller, postvs, norm_attr, max_index, fallback_stride) if norm_attr else None
-    uvs = read_postvs_attr(controller, postvs, uv_attr, max_index, fallback_stride) if uv_attr else None
+    normals = read_postvs_selected(vb_data, stride, norm_attr, unique_locals) if norm_attr else None
+    uvs = read_postvs_selected(vb_data, stride, uv_attr, unique_locals) if uv_attr else None
 
     path = os.path.join(out_dir, mesh_name + "_posed.obj")
     space_note = "world/view-space output" if alt_pos_attr is not None else \
         "reconstructed view-space (undistorted, uniform scale unknown - see README)"
-    write_obj(path, action, positions, normals, uvs, indices, note=space_note)
+    write_obj(path, action, positions, normals, uvs, face_indices, note=space_note)
     return path
 
 
