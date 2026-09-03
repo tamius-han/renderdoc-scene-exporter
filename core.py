@@ -111,9 +111,9 @@ def read_attr(controller, vbuffers, attr, max_index):
     return out
 
 
-def write_obj(path, action, positions, normals, uvs, indices):
+def write_obj(path, action, positions, normals, uvs, indices, note=None):
     with open(path, "w") as f:
-        f.write("# eid={}\n".format(action.eventId))
+        f.write("# eid={}{}\n".format(action.eventId, " - " + note if note else ""))
         for p in positions:
             vals = (list(p) + [0, 0, 0])[:3] if p else [0, 0, 0]
             f.write("v {} {} {}\n".format(*vals))
@@ -307,8 +307,9 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
     # gl_Position). If the shader ALSO passes through a separate, named
     # position-like varying (very common for lighting, e.g. "WorldPos"),
     # prefer that - it's the mesh's pose without camera-projection distortion.
-    # Otherwise fall back to the clip-space position and perspective-divide
-    # it, which gives you the shape literally as projected on screen.
+    # Otherwise fall back to reconstructing an approximate view-space
+    # position from the clip-space output (see below) rather than a plain
+    # perspective divide, to avoid aspect/depth distortion.
     clip_pos_attr = outputs[0]
     alt_pos_attr = None
     norm_attr = None
@@ -329,12 +330,27 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
         raw_positions = read_postvs_attr(controller, postvs, clip_pos_attr, max_index, fallback_stride)
         positions = None
         if raw_positions:
+            # No separate world/view-space output exists, so reconstruct an
+            # approximate (uniformly-scaled) view-space position from the
+            # builtin clip-space position instead of doing a perspective
+            # divide. For essentially every standard perspective projection
+            # matrix, clip.w IS the view-space depth (that's the value the
+            # GPU divides by to project) - so instead of collapsing into
+            # NDC (which bakes in the aspect ratio on X and a non-linear
+            # depth curve on Z), we use w directly as z, and undo the
+            # projection matrix's aspect-ratio scaling on x. This leaves
+            # the mesh's proportions and depth undistorted, at the cost of
+            # an unknown-but-uniform overall scale factor tied to the
+            # camera's vertical FOV (shape is correct, absolute size isn't).
+            vp = state.GetViewport(0)
+            aspect = (vp.width / vp.height) if vp and vp.height else 1.0
             positions = []
             for p in raw_positions:
-                if p is None or len(p) < 4 or p[3] == 0:
+                if p is None or len(p) < 4:
                     positions.append(None)
                 else:
-                    positions.append((p[0] / p[3], p[1] / p[3], p[2] / p[3]))
+                    x, y, _z, w = p[0], p[1], p[2], p[3]
+                    positions.append((x * aspect, y, w))
 
     if not positions:
         return None
@@ -343,7 +359,9 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
     uvs = read_postvs_attr(controller, postvs, uv_attr, max_index, fallback_stride) if uv_attr else None
 
     path = os.path.join(out_dir, mesh_name + "_posed.obj")
-    write_obj(path, action, positions, normals, uvs, indices)
+    space_note = "world/view-space output" if alt_pos_attr is not None else \
+        "reconstructed view-space (undistorted, uniform scale unknown - see README)"
+    write_obj(path, action, positions, normals, uvs, indices, note=space_note)
     return path
 
 
