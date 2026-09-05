@@ -39,6 +39,75 @@ def get_root_actions(ctx):
     return ctx.GetDrawcalls()
 
 
+def get_pass_key(action):
+    """Identify which 'pass' a draw belongs to by the set of render targets
+    it writes into - a shadow pass, a G-buffer pass, and a final backbuffer
+    pass all write to distinct targets, so this is a reliable, engine-
+    agnostic way to separate passes without depending on debug marker names
+    (which may not exist at all).
+
+    Uses ActionDescription.outputs/depthOut directly rather than replaying
+    to the event and reading PipeState.GetOutputTargets()/GetDepthTarget() -
+    these are populated on the action itself at capture-parse time (the
+    docs describe `outputs` as existing specifically for "coarse bucketing
+    of actions into similar passes"), so this needs no SetFrameEvent/replay
+    at all and is effectively free to compute for every action up front.
+
+    Returns a hashable (colorTargets, depth) key - all ResourceIds
+    converted to plain ints so it's JSON-serializable and safe to use as a
+    dict key."""
+    depth_id = int(action.depthOut) if action.depthOut != rd.ResourceId.Null() else 0
+    col_ids = tuple(sorted(int(r) for r in action.outputs if r != rd.ResourceId.Null()))
+    return (col_ids, depth_id)
+
+
+# Short filesystem-safe tag -> human-readable label, for the pass-selection
+# dialog and folder naming. These are best-effort GUESSES based only on
+# render target shape (count of color targets, presence of depth, whether
+# a target is the actual swapchain image) - there's no ground truth without
+# engine source or debug markers, so treat these as hints, not facts.
+PASS_CLASSIFICATIONS = {
+    "final": "final / presented to screen",
+    "shadow": "depth-only (likely shadow map / depth prepass)",
+    "gbuffer": "multiple color targets (likely G-buffer / deferred)",
+    "forward": "single color + depth (likely main/forward scene pass)",
+    "postprocess": "single color, no depth (likely post-process / composite)",
+    "misc": "uncategorized",
+}
+
+
+def classify_pass(ctx, color_ids_raw, depth_id_raw):
+    """Best-effort, non-authoritative guess at what a pass is for. Returns
+    a (tag, label) pair - tag is a short filesystem-safe string (see
+    PASS_CLASSIFICATIONS), label is the human-readable description.
+    color_ids_raw/depth_id_raw must be actual ResourceId objects (not the
+    plain ints from get_pass_key) since they're used to look up texture
+    info via ctx.GetTexture()."""
+    try:
+        color_texs = [t for t in (ctx.GetTexture(rid) for rid in color_ids_raw) if t]
+        depth_tex = None
+        if depth_id_raw and depth_id_raw != rd.ResourceId.Null():
+            depth_tex = ctx.GetTexture(depth_id_raw)
+
+        if any(t.creationFlags & rd.TextureCategory.SwapBuffer for t in color_texs):
+            tag = "final"
+        elif not color_texs and depth_tex is not None:
+            tag = "shadow"
+        elif len(color_texs) >= 2:
+            tag = "gbuffer"
+        elif len(color_texs) == 1 and depth_tex is not None:
+            tag = "forward"
+        elif len(color_texs) == 1:
+            tag = "postprocess"
+        else:
+            tag = "misc"
+    except Exception as e:
+        print("[SceneExporter] pass classification failed: {}".format(e))
+        tag = "misc"
+    return tag, PASS_CLASSIFICATIONS[tag]
+
+
+
 # ---------------------------------------------------------------------------
 # Vertex attribute decoding
 # ---------------------------------------------------------------------------
@@ -121,8 +190,74 @@ def read_selected(data, stride, byte_offset_in_vertex, fmt, unique_locals):
     return out
 
 
-def write_obj(path, action, positions, normals, uvs, indices, note=None):
+def pick_material_textures(bindings):
+    """Best-effort guess at which bound texture is the diffuse/albedo map
+    and which (if any) is a normal/bump map, from a draw's texture
+    bindings list (as built in run_export - each entry has "name" and
+    "textureFile", relative to the pass folder). Falls back to the first
+    bound texture as diffuse if no name match is found. Returns
+    (diffuse_binding, normal_binding), either of which may be None."""
+    diffuse = None
+    normal = None
+    for b in bindings:
+        if not b.get("textureFile"):
+            continue
+        nm = (b.get("name") or "").lower()
+        if diffuse is None and any(k in nm for k in
+                                    ("diffuse", "albedo", "basecolor", "base_color", "colour")):
+            diffuse = b
+        elif normal is None and any(k in nm for k in ("normal", "bump", "nrm")):
+            normal = b
+    if diffuse is None:
+        for b in bindings:
+            if b.get("textureFile") and b is not normal:
+                diffuse = b
+                break
+    return diffuse, normal
+
+
+def write_mtl_and_get_directives(pass_dir, mesh_dir, mesh_name, bindings):
+    """Writes a companion .mtl file next to the .obj (if any usable texture
+    was bound) so Blender's OBJ importer auto-assigns it as a material,
+    wired to the mesh's existing UV coordinates. Returns the (mtllib,
+    usemtl) directive lines to embed in the .obj header, or (None, None)
+    if there's nothing to reference."""
+    if not bindings:
+        return None, None
+    diffuse, normal = pick_material_textures(bindings)
+    if diffuse is None:
+        return None, None
+
+    def resolve(b):
+        # b["textureFile"] is relative to pass_dir (see run_export) -
+        # resolve to absolute, then re-relativize to wherever the .mtl
+        # actually lives (mesh_dir), since those aren't the same folder.
+        return os.path.normpath(os.path.join(pass_dir, b["textureFile"]))
+
+    mat_name = "mat_" + mesh_name
+    mtl_path = os.path.join(mesh_dir, mesh_name + ".mtl")
+    diffuse_rel = os.path.relpath(resolve(diffuse), mesh_dir).replace(os.sep, "/")
+    lines = [
+        "newmtl {}\n".format(mat_name),
+        "Kd 1.000 1.000 1.000\n",
+        "map_Kd {}\n".format(diffuse_rel),
+    ]
+    if normal is not None:
+        normal_rel = os.path.relpath(resolve(normal), mesh_dir).replace(os.sep, "/")
+        lines.append("bump {}\n".format(normal_rel))
+
+    with open(mtl_path, "w") as f:
+        f.write("".join(lines))
+
+    return "mtllib {}\n".format(mesh_name + ".mtl"), "usemtl {}\n".format(mat_name)
+
+
+def write_obj(path, action, positions, normals, uvs, indices, note=None, mtllib=None, usemtl=None):
     lines = ["# eid={}{}\n".format(action.eventId, " - " + note if note else "")]
+    if mtllib:
+        lines.append(mtllib)
+    if usemtl:
+        lines.append(usemtl)
     for p in positions:
         vals = (list(p) + [0, 0, 0])[:3] if p else [0, 0, 0]
         lines.append("v {} {} {}\n".format(*vals))
@@ -155,7 +290,7 @@ def write_obj(path, action, positions, normals, uvs, indices, note=None):
         f.write("".join(lines))
 
 
-def export_mesh_for_action(controller, state, action, out_dir, mesh_name):
+def export_mesh_for_action(controller, state, action, out_dir, mesh_name, pass_dir=None, bindings=None):
     """Reads raw input-assembler vertex data for one draw and writes an OBJ.
     This is the pre-transform (bind pose / object space) geometry.
 
@@ -231,7 +366,10 @@ def export_mesh_for_action(controller, state, action, out_dir, mesh_name):
         return None
 
     path = os.path.join(out_dir, mesh_name + ".obj")
-    write_obj(path, action, positions, normals, uvs, face_indices)
+    mtllib = usemtl = None
+    if pass_dir is not None and bindings:
+        mtllib, usemtl = write_mtl_and_get_directives(pass_dir, out_dir, mesh_name, bindings)
+    write_obj(path, action, positions, normals, uvs, face_indices, mtllib=mtllib, usemtl=usemtl)
     return path
 
 
@@ -254,6 +392,90 @@ def vartype_struct_char(vartype):
         rd.VarType.ULong: 'Q',
         rd.VarType.Bool: 'I',
     }.get(vartype)
+
+
+def find_vertex_shader_view_scale(controller, state, cache):
+    """Best-effort: scan the vertex shader's constant buffers for a 4x4
+    matrix that looks like a standalone view/projection matrix (i.e. not
+    already combined with a per-object model matrix), and return its Y-axis
+    scale term e = 1/tan(fovY/2).
+
+    Why this matters: clip.x = x_view*e/aspect and clip.y = y_view*e, but
+    clip.w = z_view exactly with NO e factor. So after undoing the aspect
+    ratio, X/Y end up scaled by e relative to Z - if e != 1 (i.e. the FOV
+    isn't exactly 90 degrees), depth comes out compressed or stretched
+    relative to X/Y. Dividing X/Y by e (done by the caller) recovers exact
+    view-space units.
+
+    e sits on the matrix diagonal, which survives a row-major/column-major
+    transpose, so we don't need to know the shader's packing convention to
+    read it - we only need to recognise a projection matrix in the first
+    place, which we do by checking both transposes' usual slot for the
+    telltale "copy z into w" entry.
+
+    Returns None if nothing matching is found - this happens if the shader
+    only exposes a pre-multiplied ModelViewProjection matrix, since combining
+    with a per-object model matrix destroys this clean signature. Results
+    are cached per vertex-shader resource ID since the view/projection
+    matrix is normally the same across every draw sharing that shader.
+    """
+    refl = state.GetShaderReflection(rd.ShaderStage.Vertex)
+    if refl is None or not refl.constantBlocks:
+        return None
+
+    cache_key = refl.resourceId
+    if cache_key in cache:
+        return cache[cache_key]
+
+    result = None
+    try:
+        pipe = state.GetGraphicsPipelineObject()
+        entry = state.GetShaderEntryPoint(rd.ShaderStage.Vertex)
+
+        def cell(flat, r, c):
+            return flat[r * 4 + c]
+
+        def scan(variables):
+            for v in variables:
+                if v.members:
+                    found = scan(v.members)
+                    if found is not None:
+                        return found
+                    continue
+                if v.rows == 4 and v.columns == 4:
+                    try:
+                        flat = list(v.value.f32v[:16])
+                    except Exception:
+                        continue
+                    if len(flat) < 16:
+                        continue
+                    near1_23 = abs(abs(cell(flat, 2, 3)) - 1.0) < 0.01 and abs(cell(flat, 3, 3)) < 1e-3
+                    near1_32 = abs(abs(cell(flat, 3, 2)) - 1.0) < 0.01 and abs(cell(flat, 3, 3)) < 1e-3
+                    if near1_23 or near1_32:
+                        e = cell(flat, 1, 1)
+                        if e:
+                            return abs(e)
+            return None
+
+        for i in range(len(refl.constantBlocks)):
+            try:
+                cb = state.GetConstantBlock(rd.ShaderStage.Vertex, i, 0)
+                if cb.descriptor.resource == rd.ResourceId.Null():
+                    continue
+                variables = controller.GetCBufferVariableContents(
+                    pipe, refl.resourceId, rd.ShaderStage.Vertex, entry, i,
+                    cb.descriptor.resource, 0, 0)
+            except Exception:
+                continue
+            found = scan(variables)
+            if found is not None:
+                result = found
+                break
+    except Exception as e:
+        print("[SceneExporter] projection scale detection failed: {}".format(e))
+
+    cache[cache_key] = result
+    return result
 
 
 def build_postvs_outputs(vs_refl):
@@ -320,7 +542,8 @@ def get_postvs_indices(controller, postvs):
     return list(range(postvs.numIndices))
 
 
-def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
+def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name, proj_scale_cache,
+                                  pass_dir=None, bindings=None):
     """Reads the vertex shader's OUTPUT data for one draw (post skinning,
     morphing, and any transform the shader applies) and writes an OBJ - this
     is the mesh 'as posed', matching what's actually drawn on screen.
@@ -379,6 +602,8 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
         elif uv_attr is None and ('TEXCOORD' in nm or 'UV' in nm):
             uv_attr = o
 
+    is_ortho = None
+    e_scale = None
     if alt_pos_attr is not None:
         raw_positions = read_postvs_selected(vb_data, stride, alt_pos_attr, unique_locals)
         positions = [p[:3] if p else None for p in raw_positions] if raw_positions else None
@@ -389,24 +614,47 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
             # No separate world/view-space output exists, so reconstruct an
             # approximate (uniformly-scaled) view-space position from the
             # builtin clip-space position instead of doing a perspective
-            # divide. For essentially every standard perspective projection
-            # matrix, clip.w IS the view-space depth (that's the value the
-            # GPU divides by to project) - so instead of collapsing into
-            # NDC (which bakes in the aspect ratio on X and a non-linear
-            # depth curve on Z), we use w directly as z, and undo the
-            # projection matrix's aspect-ratio scaling on x. This leaves
-            # the mesh's proportions and depth undistorted, at the cost of
-            # an unknown-but-uniform overall scale factor tied to the
-            # camera's vertical FOV (shape is correct, absolute size isn't).
+            # divide. For a standard PERSPECTIVE projection matrix, clip.w
+            # IS the view-space depth (that's the value the GPU divides by
+            # to project) - so instead of collapsing into NDC (which bakes
+            # in the aspect ratio on X and a non-linear depth curve on Z),
+            # we use w directly as z, and undo the projection matrix's
+            # aspect-ratio scaling on x.
+            #
+            # For an ORTHOGRAPHIC projection, though, w is always exactly
+            # 1.0 for every vertex (there's no perspective divide) - using
+            # it as z would make every object come out perfectly flat. In
+            # that case clip.z is already linear (orthographic has no
+            # divide, so no non-linear compression to worry about), so we
+            # use it directly instead. Detect which case applies per-draw
+            # by checking whether w is uniformly ~1 across this draw.
             vp = state.GetViewport(0)
             aspect = (vp.width / vp.height) if vp and vp.height else 1.0
+
+            ws = [p[3] for p in raw_positions if p is not None and len(p) >= 4]
+            is_ortho = bool(ws) and all(abs(w - 1.0) < 1e-4 for w in ws)
+
+            # clip.x = x_view*e/aspect and clip.y = y_view*e (e = 1/tan(fovY/2)),
+            # but clip.w = z_view with NO e factor - so after undoing the
+            # aspect ratio, X/Y are scaled by e relative to Z unless we also
+            # divide them by e. Perspective only; orthographic has no e term.
+            e_scale = None if is_ortho else find_vertex_shader_view_scale(controller, state, proj_scale_cache)
+
             positions = []
             for p in raw_positions:
                 if p is None or len(p) < 4:
                     positions.append(None)
+                    continue
+                x, y, z, w = p[0], p[1], p[2], p[3]
+                if is_ortho:
+                    positions.append((x * aspect, y, z))
+                elif w:
+                    if e_scale:
+                        positions.append((x * aspect / e_scale, y / e_scale, w))
+                    else:
+                        positions.append((x * aspect, y, w))
                 else:
-                    x, y, _z, w = p[0], p[1], p[2], p[3]
-                    positions.append((x * aspect, y, w))
+                    positions.append((x * aspect, y, z))
 
     if not positions:
         return None
@@ -415,9 +663,18 @@ def export_posed_mesh_for_action(controller, state, action, out_dir, mesh_name):
     uvs = read_postvs_selected(vb_data, stride, uv_attr, unique_locals) if uv_attr else None
 
     path = os.path.join(out_dir, mesh_name + "_posed.obj")
-    space_note = "world/view-space output" if alt_pos_attr is not None else \
-        "reconstructed view-space (undistorted, uniform scale unknown - see README)"
-    write_obj(path, action, positions, normals, uvs, face_indices, note=space_note)
+    mtllib = usemtl = None
+    if pass_dir is not None and bindings:
+        mtllib, usemtl = write_mtl_and_get_directives(pass_dir, out_dir, mesh_name + "_posed", bindings)
+    if alt_pos_attr is not None:
+        space_note = "world/view-space output"
+    elif is_ortho:
+        space_note = "reconstructed view-space, orthographic (undistorted - see README)"
+    elif e_scale:
+        space_note = "reconstructed view-space, perspective (exact units - projection matrix found in shader constants)"
+    else:
+        space_note = "reconstructed view-space, perspective (X/Y vs Z scale unknown - no projection matrix found in shader constants, see README)"
+    write_obj(path, action, positions, normals, uvs, face_indices, note=space_note, mtllib=mtllib, usemtl=usemtl)
     return path
 
 
@@ -443,6 +700,69 @@ def export_texture(controller, resource_id, out_dir, tex_cache):
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def show_pass_selection(mqt, passes):
+    """Blocking modal checkbox dialog letting the user pick which detected
+    passes to export. Safe to use ShowWidgetAsDialog here specifically
+    because nothing else needs to call back into the UI thread while it's
+    up (the scan's AsyncInvoke has already fully finished by this point) -
+    unlike the earlier progress-bar attempts, there's no concurrent async
+    activity for this dialog to conflict with.
+
+    Returns a set of selected pass keys, or None if the user cancelled."""
+    checkboxes = []
+
+    top = mqt.CreateToplevelWidget("SceneExporter - select passes", lambda c, w, t: None)
+    outer = mqt.CreateVerticalContainer()
+    mqt.AddWidget(top, outer)
+
+    label = mqt.CreateLabel()
+    mqt.SetWidgetText(label, "Select which render pass(es) to export (guessed roles in brackets - not authoritative):")
+    mqt.AddWidget(outer, label)
+
+    for p in passes:
+        cb = mqt.CreateCheckbox(lambda c, w, t: None)
+        mqt.SetWidgetChecked(cb, True)
+        mqt.SetWidgetText(cb, "pass_{:02d}  [{}]  -  {} draw(s), {} color target(s), depth={}".format(
+            p["index"], p["label"], p["count"], len(p["colorTargets"]), "yes" if p["depthTarget"] else "no"))
+        mqt.AddWidget(outer, cb)
+        checkboxes.append((p["key"], cb))
+
+    toggle_row = mqt.CreateHorizontalContainer()
+    mqt.AddWidget(outer, toggle_row)
+
+    def select_all(c, w, t):
+        for _, cb in checkboxes:
+            mqt.SetWidgetChecked(cb, True)
+
+    def select_none(c, w, t):
+        for _, cb in checkboxes:
+            mqt.SetWidgetChecked(cb, False)
+
+    all_btn = mqt.CreateButton(select_all)
+    mqt.SetWidgetText(all_btn, "Select All")
+    mqt.AddWidget(toggle_row, all_btn)
+
+    none_btn = mqt.CreateButton(select_none)
+    mqt.SetWidgetText(none_btn, "Select None")
+    mqt.AddWidget(toggle_row, none_btn)
+
+    action_row = mqt.CreateHorizontalContainer()
+    mqt.AddWidget(outer, action_row)
+
+    export_btn = mqt.CreateButton(lambda c, w, t: mqt.CloseCurrentDialog(True))
+    mqt.SetWidgetText(export_btn, "Export Selected")
+    mqt.AddWidget(action_row, export_btn)
+
+    cancel_btn = mqt.CreateButton(lambda c, w, t: mqt.CloseCurrentDialog(False))
+    mqt.SetWidgetText(cancel_btn, "Cancel")
+    mqt.AddWidget(action_row, cancel_btn)
+
+    confirmed = mqt.ShowWidgetAsDialog(top)
+    selected = set(key for key, cb in checkboxes if mqt.IsWidgetChecked(cb)) if confirmed else None
+    mqt.DestroyWidget(top)
+    return selected
+
+
 def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
     ext = ctx.Extensions()
 
@@ -454,95 +774,222 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
     if not out_dir:
         return
 
-    meshes_dir = os.path.join(out_dir, "meshes")
+    # Textures are shared/deduplicated across the whole export (the same
+    # texture is often read by multiple passes), so they live in one common
+    # folder. Meshes are split per-pass instead - see get_pass_key().
     textures_dir = os.path.join(out_dir, "textures")
-    os.makedirs(meshes_dir, exist_ok=True)
     os.makedirs(textures_dir, exist_ok=True)
-    posed_dir = None
-    if export_posed:
-        posed_dir = os.path.join(out_dir, "meshes_posed")
-        os.makedirs(posed_dir, exist_ok=True)
 
-    manifest = {"draws": []}
-    tex_cache = {}
-    errors = []
+    mqt = ext.GetMiniQtHelper()
 
-    def do_export(controller: rd.ReplayController):
+    def safe_ui_update(fn):
         try:
-            actions = get_all_actions(get_root_actions(ctx))
-            sdfile = controller.GetStructuredFile()
-
-            if not actions:
-                errors.append("No draw calls were found in this capture's action tree.")
-                return
-
-            for action in actions:
-                controller.SetFrameEvent(action.eventId, False)
-                state = controller.GetPipelineState()
-
-                mesh_name = "eid{}".format(action.eventId)
-                mesh_path = export_mesh_for_action(controller, state, action, meshes_dir, mesh_name)
-
-                posed_path = None
-                if export_posed:
-                    try:
-                        posed_path = export_posed_mesh_for_action(controller, state, action, posed_dir, mesh_name)
-                    except Exception as e:
-                        print("[SceneExporter] posed mesh export failed at eid {}: {}".format(action.eventId, e))
-
-                bindings = []
-                try:
-                    # GetReadOnlyResources returns a flat List[UsedDescriptor].
-                    # Each entry's actual bound resource is at .descriptor.resource,
-                    # and .access.index gives the position in the shader
-                    # reflection's readOnlyResources list (for the variable name).
-                    ro = state.GetReadOnlyResources(rd.ShaderStage.Pixel)
-                    refl = state.GetShaderReflection(rd.ShaderStage.Pixel)
-                    for used in ro:
-                        desc = used.descriptor
-                        if desc is None or desc.resource == rd.ResourceId.Null():
-                            continue
-                        tex_file = export_texture(controller, desc.resource, textures_dir, tex_cache)
-                        var_name = None
-                        idx = used.access.index
-                        if refl and 0 <= idx < len(refl.readOnlyResources):
-                            var_name = refl.readOnlyResources[idx].name
-                        bindings.append({
-                            "bindPoint": idx,
-                            "name": var_name,
-                            "textureFile": os.path.relpath(tex_file, out_dir) if tex_file else None,
-                        })
-                except Exception as e:
-                    print("[SceneExporter] texture read failed at eid {}: {}".format(action.eventId, e))
-
-                try:
-                    name = action.GetName(sdfile)
-                except Exception:
-                    name = str(action.eventId)
-
-                manifest["draws"].append({
-                    "eventId": action.eventId,
-                    "name": name,
-                    "mesh": os.path.relpath(mesh_path, out_dir) if mesh_path else None,
-                    "posedMesh": os.path.relpath(posed_path, out_dir) if posed_path else None,
-                    "textures": bindings,
-                })
+            mqt.InvokeOntoUIThread(fn)
         except Exception:
-            import traceback
-            tb = traceback.format_exc()
-            print("[SceneExporter] export failed:\n" + tb)
-            errors.append(tb)
+            pass
 
-    ctx.Replay().BlockInvoke(do_export)
-
-    if errors:
-        ext.ErrorDialog("Export hit an error:\n\n" + errors[0], "SceneExporter")
+    # --- Phase 1: scan the capture for distinct passes ----------------------
+    # get_pass_key() reads data (outputs/depthOut) already sitting on each
+    # ActionDescription from when the capture was parsed, so this needs no
+    # replay/SetFrameEvent at all - it's just a plain Python loop over
+    # already-cached UI-thread data, done directly here rather than via
+    # AsyncInvoke.
+    actions = get_all_actions(get_root_actions(ctx))
+    if not actions:
+        ext.MessageDialog("No draw calls were found in this capture's action tree.", "SceneExporter")
         return
 
-    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=2)
+    found = {}
+    for action in actions:
+        key = get_pass_key(action)
+        p = found.get(key)
+        if p is None:
+            color_ids, depth_id = key
+            tag, label = classify_pass(
+                ctx,
+                [r for r in action.outputs if r != rd.ResourceId.Null()],
+                action.depthOut)
+            p = {
+                "key": key,
+                "index": len(found),
+                "colorTargets": list(color_ids),
+                "depthTarget": depth_id,
+                "count": 0,
+                "firstEventId": action.eventId,
+                "tag": tag,
+                "label": label,
+            }
+            found[key] = p
+        p["count"] += 1
+    passes = sorted(found.values(), key=lambda p: p["index"])
+    print("[SceneExporter] found {} pass(es) across {} draws.".format(len(passes), len(actions)))
 
+    # --- Phase 2: let the user pick which passes to export ------------------
+    selected_keys = show_pass_selection(mqt, passes)
+    if selected_keys is None:
+        print("[SceneExporter] export cancelled.")
+        return
+    if not selected_keys:
+        ext.MessageDialog("No passes selected - nothing to export.", "SceneExporter")
+        return
 
-    ext.MessageDialog(
-        "Exported {} draws to:\n{}".format(len(manifest["draws"]), out_dir),
-        "SceneExporter")
+    # --- Phase 3: the real export, filtered to selected passes -------------
+    def start_export(selected_keys):
+        tex_cache = {}
+        proj_scale_cache = {}
+        errors = []
+        passes_out = {}  # pass_key -> {index, dir, meshes_dir, posed_dir, colorTargets, depthTarget, draws}
+        # Reuse the classification already computed during the scan (phase 1)
+        # rather than re-deriving it - `passes` is the sorted list from that
+        # scan, still in scope here via closure.
+        scanned_by_key = {p["key"]: p for p in passes}
+
+        def get_pass_dir(key):
+            pinfo = passes_out.get(key)
+            if pinfo is None:
+                idx = len(passes_out)
+                scanned = scanned_by_key.get(key)
+                tag = scanned["tag"] if scanned else "misc"
+                label = scanned["label"] if scanned else PASS_CLASSIFICATIONS["misc"]
+                pass_dir = os.path.join(out_dir, "pass_{:02d}_{}".format(idx, tag))
+                meshes_dir = os.path.join(pass_dir, "meshes")
+                os.makedirs(meshes_dir, exist_ok=True)
+                posed_dir = None
+                if export_posed:
+                    posed_dir = os.path.join(pass_dir, "meshes_posed")
+                    os.makedirs(posed_dir, exist_ok=True)
+                color_ids, depth_id = key
+                pinfo = {
+                    "index": idx,
+                    "dir": pass_dir,
+                    "meshes_dir": meshes_dir,
+                    "posed_dir": posed_dir,
+                    "colorTargets": list(color_ids),
+                    "depthTarget": depth_id,
+                    "guessedRole": label,
+                    "draws": [],
+                }
+                passes_out[key] = pinfo
+            return pinfo
+
+        def do_export(controller: rd.ReplayController):
+            try:
+                actions = get_all_actions(get_root_actions(ctx))
+                sdfile = controller.GetStructuredFile()
+                total = len(actions)
+                print("[SceneExporter] exporting {} selected pass(es) from {} candidate draws...".format(
+                    len(selected_keys), total))
+                update_every = max(1, total // 20)
+
+                for i, action in enumerate(actions):
+                    # Check membership BEFORE replaying to this event at all -
+                    # get_pass_key() needs no replay, so excluded passes pay
+                    # zero SetFrameEvent cost instead of being stepped through
+                    # and then discarded.
+                    key = get_pass_key(action)
+                    if key not in selected_keys:
+                        continue
+
+                    controller.SetFrameEvent(action.eventId, False)
+                    state = controller.GetPipelineState()
+                    pinfo = get_pass_dir(key)
+
+                    bindings = []
+                    try:
+                        # GetReadOnlyResources returns a flat List[UsedDescriptor].
+                        # Each entry's actual bound resource is at .descriptor.resource,
+                        # and .access.index gives the position in the shader
+                        # reflection's readOnlyResources list (for the variable name).
+                        ro = state.GetReadOnlyResources(rd.ShaderStage.Pixel)
+                        refl = state.GetShaderReflection(rd.ShaderStage.Pixel)
+                        for used in ro:
+                            desc = used.descriptor
+                            if desc is None or desc.resource == rd.ResourceId.Null():
+                                continue
+                            tex_file = export_texture(controller, desc.resource, textures_dir, tex_cache)
+                            var_name = None
+                            bindidx = used.access.index
+                            if refl and 0 <= bindidx < len(refl.readOnlyResources):
+                                var_name = refl.readOnlyResources[bindidx].name
+                            bindings.append({
+                                "bindPoint": bindidx,
+                                "name": var_name,
+                                # Relative to this pass's own manifest.json, e.g. "../textures/tex_45.png"
+                                "textureFile": os.path.relpath(tex_file, pinfo["dir"]) if tex_file else None,
+                            })
+                    except Exception as e:
+                        print("[SceneExporter] texture read failed at eid {}: {}".format(action.eventId, e))
+
+                    mesh_name = "eid{}".format(action.eventId)
+                    mesh_path = export_mesh_for_action(
+                        controller, state, action, pinfo["meshes_dir"], mesh_name,
+                        pass_dir=pinfo["dir"], bindings=bindings)
+
+                    posed_path = None
+                    if export_posed:
+                        try:
+                            posed_path = export_posed_mesh_for_action(
+                                controller, state, action, pinfo["posed_dir"], mesh_name, proj_scale_cache,
+                                pass_dir=pinfo["dir"], bindings=bindings)
+                        except Exception as e:
+                            print("[SceneExporter] posed mesh export failed at eid {}: {}".format(action.eventId, e))
+
+                    try:
+                        name = action.GetName(sdfile)
+                    except Exception:
+                        name = str(action.eventId)
+
+                    pinfo["draws"].append({
+                        "eventId": action.eventId,
+                        "name": name,
+                        "mesh": os.path.relpath(mesh_path, pinfo["dir"]) if mesh_path else None,
+                        "posedMesh": os.path.relpath(posed_path, pinfo["dir"]) if posed_path else None,
+                        "textures": bindings,
+                    })
+
+                    done = i + 1
+                    if done % update_every == 0 or done == total:
+                        print("[SceneExporter] scanned {}/{}, exported {} so far".format(
+                            done, total, sum(len(p["draws"]) for p in passes_out.values())))
+            except Exception:
+                import traceback
+                tb = traceback.format_exc()
+                print("[SceneExporter] export failed:\n" + tb)
+                errors.append(tb)
+            finally:
+                # File I/O is fine directly on the replay thread; only dialog
+                # calls need to be marshalled onto the UI thread.
+                try:
+                    index = {"passes": []}
+                    for pinfo in sorted(passes_out.values(), key=lambda p: p["index"]):
+                        with open(os.path.join(pinfo["dir"], "manifest.json"), "w") as f:
+                            json.dump({"draws": pinfo["draws"]}, f, indent=2)
+                        index["passes"].append({
+                            "folder": os.path.basename(pinfo["dir"]),
+                            "index": pinfo["index"],
+                            "guessedRole": pinfo["guessedRole"],
+                            "colorTargets": pinfo["colorTargets"],
+                            "depthTarget": pinfo["depthTarget"],
+                            "drawCount": len(pinfo["draws"]),
+                        })
+                    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+                        json.dump(index, f, indent=2)
+                except Exception:
+                    import traceback
+                    print("[SceneExporter] failed writing manifest.json:\n" + traceback.format_exc())
+
+                def finish():
+                    if errors:
+                        ext.ErrorDialog("Export hit an error:\n\n" + errors[0], "SceneExporter")
+                    else:
+                        total_draws = sum(len(p["draws"]) for p in passes_out.values())
+                        ext.MessageDialog(
+                            "Exported {} draws across {} pass(es) to:\n{}".format(
+                                total_draws, len(passes_out), out_dir),
+                            "SceneExporter")
+                safe_ui_update(finish)
+
+        print("[SceneExporter] export started in the background - progress prints to the console.")
+        ctx.Replay().AsyncInvoke("SceneExporterExport", do_export)
+
+    start_export(selected_keys)
