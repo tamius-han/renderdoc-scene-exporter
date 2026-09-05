@@ -67,11 +67,11 @@ def get_pass_key(action):
 # a target is the actual swapchain image) - there's no ground truth without
 # engine source or debug markers, so treat these as hints, not facts.
 PASS_CLASSIFICATIONS = {
-    "final": "final / presented to screen",
-    "shadow": "depth-only (likely shadow map / depth prepass)",
-    "gbuffer": "multiple color targets (likely G-buffer / deferred)",
-    "forward": "single color + depth (likely main/forward scene pass)",
-    "postprocess": "single color, no depth (likely post-process / composite)",
+    "final": "🏁 final/presented to screen",
+    "shadow": "depth-only",
+    "gbuffer": "likely G-buffer/deferred (multiple color targets)",
+    "forward": "🔶 possible main/forward scene pass (single color + depth)",
+    "postprocess": "likely post-process/composite (single color, no depth)",
     "misc": "uncategorized",
 }
 
@@ -102,7 +102,7 @@ def classify_pass(ctx, color_ids_raw, depth_id_raw):
         else:
             tag = "misc"
     except Exception as e:
-        print("[SceneExporter] pass classification failed: {}".format(e))
+        print("[Renderdoc Scene Exporter] pass classification failed: {}".format(e))
         tag = "misc"
     return tag, PASS_CLASSIFICATIONS[tag]
 
@@ -472,7 +472,7 @@ def find_vertex_shader_view_scale(controller, state, cache):
                 result = found
                 break
     except Exception as e:
-        print("[SceneExporter] projection scale detection failed: {}".format(e))
+        print("[Renderdoc Scene Exporter] projection scale detection failed: {}".format(e))
 
     cache[cache_key] = result
     return result
@@ -711,7 +711,7 @@ def show_pass_selection(mqt, passes):
     Returns a set of selected pass keys, or None if the user cancelled."""
     checkboxes = []
 
-    top = mqt.CreateToplevelWidget("SceneExporter - select passes", lambda c, w, t: None)
+    top = mqt.CreateToplevelWidget("Renderdoc Scene Exporter - select passes", lambda c, w, t: None)
     outer = mqt.CreateVerticalContainer()
     mqt.AddWidget(top, outer)
 
@@ -767,7 +767,7 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
     ext = ctx.Extensions()
 
     if not ctx.IsCaptureLoaded():
-        ext.MessageDialog("No capture is loaded.", "SceneExporter")
+        ext.MessageDialog("No capture is loaded.", "Renderdoc Scene Exporter")
         return
 
     out_dir = ext.OpenDirectoryName("Choose export folder")
@@ -796,7 +796,7 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
     # AsyncInvoke.
     actions = get_all_actions(get_root_actions(ctx))
     if not actions:
-        ext.MessageDialog("No draw calls were found in this capture's action tree.", "SceneExporter")
+        ext.MessageDialog("No draw calls were found in this capture's action tree.", "Renderdoc Scene Exporter")
         return
 
     found = {}
@@ -822,15 +822,15 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
             found[key] = p
         p["count"] += 1
     passes = sorted(found.values(), key=lambda p: p["index"])
-    print("[SceneExporter] found {} pass(es) across {} draws.".format(len(passes), len(actions)))
+    print("[Renderdoc Scene Exporter] found {} pass(es) across {} draws.".format(len(passes), len(actions)))
 
     # --- Phase 2: let the user pick which passes to export ------------------
     selected_keys = show_pass_selection(mqt, passes)
     if selected_keys is None:
-        print("[SceneExporter] export cancelled.")
+        print("[Renderdoc Scene Exporter] export cancelled.")
         return
     if not selected_keys:
-        ext.MessageDialog("No passes selected - nothing to export.", "SceneExporter")
+        ext.MessageDialog("No passes selected - nothing to export.", "Renderdoc Scene Exporter")
         return
 
     # --- Phase 3: the real export, filtered to selected passes -------------
@@ -877,7 +877,7 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
                 actions = get_all_actions(get_root_actions(ctx))
                 sdfile = controller.GetStructuredFile()
                 total = len(actions)
-                print("[SceneExporter] exporting {} selected pass(es) from {} candidate draws...".format(
+                print("[Renderdoc Scene Exporter] exporting {} selected pass(es) from {} candidate draws...".format(
                     len(selected_keys), total))
                 update_every = max(1, total // 20)
 
@@ -918,7 +918,7 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
                                 "textureFile": os.path.relpath(tex_file, pinfo["dir"]) if tex_file else None,
                             })
                     except Exception as e:
-                        print("[SceneExporter] texture read failed at eid {}: {}".format(action.eventId, e))
+                        print("[Renderdoc Scene Exporter] texture read failed at eid {}: {}".format(action.eventId, e))
 
                     mesh_name = "eid{}".format(action.eventId)
                     mesh_path = export_mesh_for_action(
@@ -932,7 +932,7 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
                                 controller, state, action, pinfo["posed_dir"], mesh_name, proj_scale_cache,
                                 pass_dir=pinfo["dir"], bindings=bindings)
                         except Exception as e:
-                            print("[SceneExporter] posed mesh export failed at eid {}: {}".format(action.eventId, e))
+                            print("[Renderdoc Scene Exporter] posed mesh export failed at eid {}: {}".format(action.eventId, e))
 
                     try:
                         name = action.GetName(sdfile)
@@ -949,12 +949,12 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
 
                     done = i + 1
                     if done % update_every == 0 or done == total:
-                        print("[SceneExporter] scanned {}/{}, exported {} so far".format(
+                        print("[Renderdoc Scene Exporter] scanned {}/{}, exported {} so far".format(
                             done, total, sum(len(p["draws"]) for p in passes_out.values())))
             except Exception:
                 import traceback
                 tb = traceback.format_exc()
-                print("[SceneExporter] export failed:\n" + tb)
+                print("[Renderdoc Scene Exporter] export failed:\n" + tb)
                 errors.append(tb)
             finally:
                 # File I/O is fine directly on the replay thread; only dialog
@@ -976,20 +976,20 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
                         json.dump(index, f, indent=2)
                 except Exception:
                     import traceback
-                    print("[SceneExporter] failed writing manifest.json:\n" + traceback.format_exc())
+                    print("[Renderdoc Scene Exporter] failed writing manifest.json:\n" + traceback.format_exc())
 
                 def finish():
                     if errors:
-                        ext.ErrorDialog("Export hit an error:\n\n" + errors[0], "SceneExporter")
+                        ext.ErrorDialog("Export hit an error:\n\n" + errors[0], "Renderdoc Scene Exporter")
                     else:
                         total_draws = sum(len(p["draws"]) for p in passes_out.values())
                         ext.MessageDialog(
                             "Exported {} draws across {} pass(es) to:\n{}".format(
                                 total_draws, len(passes_out), out_dir),
-                            "SceneExporter")
+                            "Renderdoc Scene Exporter")
                 safe_ui_update(finish)
 
-        print("[SceneExporter] export started in the background - progress prints to the console.")
+        print("[Renderdoc Scene Exporter] export started in the background - progress prints to the console.")
         ctx.Replay().AsyncInvoke("SceneExporterExport", do_export)
 
     start_export(selected_keys)
