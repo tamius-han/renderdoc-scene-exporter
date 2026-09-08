@@ -67,10 +67,10 @@ def get_pass_key(action):
 # a target is the actual swapchain image) - there's no ground truth without
 # engine source or debug markers, so treat these as hints, not facts.
 PASS_CLASSIFICATIONS = {
-    "final": "🏁 final/presented to screen",
+    "final": "final/presented to screen",
     "shadow": "depth-only",
     "gbuffer": "likely G-buffer/deferred (multiple color targets)",
-    "forward": "🔶 possible main/forward scene pass (single color + depth)",
+    "forward": "[⟐ | FORWARD] possible main/forward scene pass (single color + depth)",
     "postprocess": "likely post-process/composite (single color, no depth)",
     "misc": "uncategorized",
 }
@@ -719,10 +719,20 @@ def show_pass_selection(mqt, passes):
     mqt.SetWidgetText(label, "Select which render pass(es) to export (guessed roles in brackets - not authoritative):")
     mqt.AddWidget(outer, label)
 
+    # find best forward pass candidate
+    best_forward_pass = None;
+    best_forward_pass_draw_count = 0;
+    
+    for p in passes: 
+        if p["tag"] == "forward":
+            if p["count"] > best_forward_pass_draw_count:
+                best_forward_pass = p["index"]
+                best_forward_pass_draw_count = p["count"]
+
     for p in passes:
         cb = mqt.CreateCheckbox(lambda c, w, t: None)
-        mqt.SetWidgetChecked(cb, True)
-        mqt.SetWidgetText(cb, "pass_{:02d}  [{}]  -  {} draw(s), {} color target(s), depth={}".format(
+        mqt.SetWidgetChecked(cb, p["index"] == best_forward_pass)
+        mqt.SetWidgetText(cb, "pass_{:02d}  —  {}  —  {} draw(s), {} color target(s), depth={}".format(
             p["index"], p["label"], p["count"], len(p["colorTargets"]), "yes" if p["depthTarget"] else "no"))
         mqt.AddWidget(outer, cb)
         checkboxes.append((p["key"], cb))

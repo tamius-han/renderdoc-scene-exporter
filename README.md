@@ -23,18 +23,21 @@ Also see "known limitations" down at the bottom.
    - Linux: `~/.local/share/qrenderdoc/extensions/`
 3. Go to `Tools > Manage Extensions`, tick **Renderdoc Scene Exporter** to load it
    (or restart RenderDoc after copying the folder).
-4. Two commands are added under **Tools**:
-   - **Export Scene (with posed meshes)...** — exports each draw's
-     vertex-shader *output* data, i.e. the geometry after whatever
-     skinning/morphing/transform the shader itself applies, as well as initial geometry
+4. `Tools` menu will get `Export scene` option.
      
 ## Usage
 
 1. Load a capture into RenderDoc
-2. Go to `Tools > Export scene (with posed meshes)`
-3. Select which render pass(es) you want to export
+2. Go to `Tools > Export scene`
+3. Select which render pass(es) you want to export. By default, extension selects only a `[⟐ | FORWARD]` option with the most draw calls, as this is probably the option you want. If that doesn't get you what you want, try other `[⟐ | FORWARD]` options. Options that aren't `[⟐ | FORWARD]` are exceedingly likely to not be what you want.
 4. Create a new folder and select it as your export destination
 5. Go get a coffee, export is gonna take five-ever
+
+## Why not [Renderdoc Resource Exporter](https://github.com/rrtt2323/RenderdocResourceExporter/tree/main/RenderdocResourceExporter)
+
+1. Renderdoc Resource Exporter appears to only export a single resource (model), not the entire scene
+2. When I try to load the addon, I get an error that says some Python library is missing
+3. RenderDoc Resource Exporter relies on `.dll` and `.exe` files, which is less than ideal when you're using Linux
 
 ## Other notes from the tin can
 
