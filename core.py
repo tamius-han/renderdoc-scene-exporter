@@ -729,6 +729,7 @@ def show_pass_selection(mqt, passes):
                 best_forward_pass = p["index"]
                 best_forward_pass_draw_count = p["count"]
 
+    checkboxes = []
     for p in passes:
         cb = mqt.CreateCheckbox(lambda c, w, t: None)
         mqt.SetWidgetChecked(cb, p["index"] == best_forward_pass)
@@ -773,7 +774,7 @@ def show_pass_selection(mqt, passes):
     return selected
 
 
-def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
+def run_export(ctx: qrd.CaptureContext, export_posed: bool = False, pass_mode: str = "all"):
     ext = ctx.Extensions()
 
     if not ctx.IsCaptureLoaded():
@@ -833,6 +834,15 @@ def run_export(ctx: qrd.CaptureContext, export_posed: bool = False):
         p["count"] += 1
     passes = sorted(found.values(), key=lambda p: p["index"])
     print("[Renderdoc Scene Exporter] found {} pass(es) across {} draws.".format(len(passes), len(actions)))
+
+    if pass_mode == "forward":
+        passes = [p for p in passes if p["tag"] == "forward"]
+    elif pass_mode == "hide_postprocess":
+        passes = [p for p in passes if p["tag"] != "postprocess"]
+
+    if not passes:
+        ext.MessageDialog("No passes matched the selected export option.", "Renderdoc Scene Exporter")
+        return
 
     # --- Phase 2: let the user pick which passes to export ------------------
     selected_keys = show_pass_selection(mqt, passes)

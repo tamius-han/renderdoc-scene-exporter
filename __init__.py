@@ -10,11 +10,19 @@ _ctx_store = {}
 def register(version: str, ctx: qrd.CaptureContext):
     print("[Renderdoc Scene Exporter] registering against RenderDoc", version)
 
-    def export_posed_callback(ctx, data):
-        core.run_export(ctx, export_posed=True)
+    def make_export_callback(pass_mode):
+        def export_callback(ctx, data):
+            core.run_export(ctx, export_posed=True, pass_mode=pass_mode)
+        return export_callback
 
-    _ctx_store['menu_item_posed'] = ctx.Extensions().RegisterWindowMenu(
-        qrd.WindowMenu.Tools, ["Export Scene ..."], export_posed_callback)
+    menu = ctx.Extensions()
+    for name, pass_mode in (
+        ("Export scene (all passes)", "all"),
+        ("Export scene (forward passes only)", "forward"),
+        ("Export scene (hide post-processing)", "hide_postprocess"),
+    ):
+        _ctx_store[name] = menu.RegisterWindowMenu(
+            qrd.WindowMenu.Tools, [name], make_export_callback(pass_mode))
 
 
 def unregister():
