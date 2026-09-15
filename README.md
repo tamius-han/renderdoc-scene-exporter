@@ -23,40 +23,23 @@ Also see "known limitations" down at the bottom.
    - Linux: `~/.local/share/qrenderdoc/extensions/`
 3. Go to `Tools > Manage Extensions`, tick **Renderdoc Scene Exporter** to load it
    (or restart RenderDoc after copying the folder).
-4. `Tools` menu gets an `Export scene (dialog)` option, plus an
-   `Export scene ...` submenu with quicker, non-interactive variants -
-   see "Usage" below.
+4. `Tools` menu gets two new options:
+    * `Export scene (dialog)` option (which would be the preferred way, but it keeps crashing Renderdoc)
+    * `Export scene ...` option, which achieves more or less the same with submenu tree
      
 ## Usage
 
 There are two ways to run an export, both under the `Tools` menu:
 
-- **`Export scene (dialog)`** walks you through folder choice, draw call
-  type(s), and pass selection via a series of popups - see "Choosing
-  which passes to export" below for details on each step.
-- **`Export scene ...`** is a submenu of fixed, one-click export
-  presets, for when you already know what you want and don't need the
-  popups:
-  - `export` / `export with instanced geometry` - pick the latter if you
-    also want per-instance data recorded for `DrawInstanced` calls (see
-    "Instanced draws" below); otherwise use `export`.
-  - Within either of those, `all`, `forward (all)`, `g-buffer (all)`, and
-    `forward & g-buffer (all)` export every matching pass straight away,
-    with no popup beyond the folder picker.
-  - `all (custom selection)`, `forward (custom)`, `g-buffer (custom)`,
-    and `forward & g-buffer (custom)` instead show the paginated
-    pass-selection popup (restricted to matching passes), defaulting to
-    just the single pass with the most draw calls checked.
+- **`Export scene (dialog)`** gives you a series of dialogs that allow you to quickly configure your export
+- **`Export scene ...`** does the same, but instead of a dialog you get a submenu tree
 
 1. Load a capture into RenderDoc
 2. Go to `Tools > Export scene (dialog)`, or pick one of the
    `Tools > Export scene ...` presets
-3. If using the dialog flow: select draw call type(s), then which render
-   pass(es) you want to export. By default, only the busiest matching
-   pass is preselected, as this is probably the option you want. If that
-   doesn't get you what you want, try other `forward`/`gbuffer` passes.
-   Passes with other guessed roles are exceedingly likely to not be what
-   you want.
+3. Select draw call type(s), then which render pass(es) you want to export. Most of the time, you probably want 
+    only the render forward or g-buffer render pass with most draw calls, as exporting a single pass is significantly faster
+    than exporting the entire capture. However, crashing may necessitate exporting all draw calls of a type, or even all draw calls.
 4. Create a new folder and select it as your export destination
 5. Go get a coffee, export is gonna take five-ever
 
