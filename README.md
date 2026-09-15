@@ -1,5 +1,12 @@
 # RenderDoc Scene Exporter (RenderDoc extension)
 
+> ### Acceptable use of this tool
+> **This tool is only intended to be used ONLY with games that explicitly allow you to use their content and ONLY within the limits outlined in the applicable game's EULA, Content Terms of Use (aka Fan use policies), and other applicable policies & laws.**
+> Extracting game assets from games without permission of the game owners very likely constitutes copyright infringement and is therefore illegal. 
+> You should consult your game's EULA and fan content policies to determine what you're allowed to do before using this addon.
+> I am not a layer and this is not legal guidance.
+
+> ### Other stuff
 > _For a non-vibe-coded alternative to this project, [pay €6.50 (+ vat)/mo for NinjaRipper](https://www.ninjaripper.com/)¹._ Then there's also [Intel GPA](https://www.intel.com/content/www/us/en/developer/tools/graphics-performance-analyzers/overview.html) (EOL; [Internet Archive mirror](https://archive.org/details/intel-gpa-framework-25.1)), which gets you easy mesh exports for free. Note that both options are Windows-only, and note that Intel GPA is considered EOL. Intel claimed the download page will be removed few months ago, which means the official (non-IA) link is on borrowed time.
 >
 > <sub>[1] €6.50+vat/mo at the time of writing. I am not gonna be keeping up with any possible future changes. Do your homework before you spend any money. I am not responsible if NinjaRipper doesn't fulfill your needs, or if NinjaRipper doesn't work with your game(s), or if you can't figure out how to use NinjaRipper, or if NinjaRipper is not fit for purpose.'</sub>
