@@ -23,13 +23,40 @@ Also see "known limitations" down at the bottom.
    - Linux: `~/.local/share/qrenderdoc/extensions/`
 3. Go to `Tools > Manage Extensions`, tick **Renderdoc Scene Exporter** to load it
    (or restart RenderDoc after copying the folder).
-4. `Tools` menu will get `Export scene` option.
+4. `Tools` menu gets an `Export scene (dialog)` option, plus an
+   `Export scene ...` submenu with quicker, non-interactive variants -
+   see "Usage" below.
      
 ## Usage
 
+There are two ways to run an export, both under the `Tools` menu:
+
+- **`Export scene (dialog)`** walks you through folder choice, draw call
+  type(s), and pass selection via a series of popups - see "Choosing
+  which passes to export" below for details on each step.
+- **`Export scene ...`** is a submenu of fixed, one-click export
+  presets, for when you already know what you want and don't need the
+  popups:
+  - `export` / `export with instanced geometry` - pick the latter if you
+    also want per-instance data recorded for `DrawInstanced` calls (see
+    "Instanced draws" below); otherwise use `export`.
+  - Within either of those, `all`, `forward (all)`, `g-buffer (all)`, and
+    `forward & g-buffer (all)` export every matching pass straight away,
+    with no popup beyond the folder picker.
+  - `all (custom selection)`, `forward (custom)`, `g-buffer (custom)`,
+    and `forward & g-buffer (custom)` instead show the paginated
+    pass-selection popup (restricted to matching passes), defaulting to
+    just the single pass with the most draw calls checked.
+
 1. Load a capture into RenderDoc
-2. Go to `Tools > Export scene`
-3. Select which render pass(es) you want to export. By default, extension selects only a `[⟐ | FORWARD]` option with the most draw calls, as this is probably the option you want. If that doesn't get you what you want, try other `[⟐ | FORWARD]` options. Options that aren't `[⟐ | FORWARD]` are exceedingly likely to not be what you want.
+2. Go to `Tools > Export scene (dialog)`, or pick one of the
+   `Tools > Export scene ...` presets
+3. If using the dialog flow: select draw call type(s), then which render
+   pass(es) you want to export. By default, only the busiest matching
+   pass is preselected, as this is probably the option you want. If that
+   doesn't get you what you want, try other `forward`/`gbuffer` passes.
+   Passes with other guessed roles are exceedingly likely to not be what
+   you want.
 4. Create a new folder and select it as your export destination
 5. Go get a coffee, export is gonna take five-ever
 
@@ -75,7 +102,7 @@ guaranteed to match any particular semantic meaning.
 
 #### Choosing which passes to export
 
-Both menu commands now run in two steps:
+`Export scene (dialog)` runs in three steps:
 
 1. **Scan** - reads `ActionDescription.outputs`/`depthOut`, which
    RenderDoc populates on every action directly from capture data (no
@@ -84,12 +111,29 @@ Both menu commands now run in two steps:
    already cached on the UI thread, so it's effectively instant regardless
    of capture size - there's no progress bar for it because there's
    nothing worth reporting progress on.
-2. **Select** - a checkbox dialog pops up immediately listing each
-   detected pass (`pass_00`, `pass_01`, ...) along with a guessed role in
-   brackets (e.g. `[depth-only (likely shadow map / depth prepass)]`),
-   its draw count, and target counts. "Select All"/"Select None" buttons
-   are provided, all passes are checked by default, and closing the
-   dialog without pressing "Export Selected" cancels the whole export
+2. **Choose draw call types** - a popup lists an "All" checkbox at the
+   top, checked by default and the only thing checked when the dialog
+   first opens, followed by the guessed pass roles that are actually
+   present in this capture (e.g. `forward`, `gbuffer`, `postprocess`,
+   ...) as unchecked checkboxes, each showing its pass and draw counts
+   ("x pass(es), y draw(s)"). If "All" is checked when you click "Next",
+   every available type is exported regardless of the individual
+   checkboxes below it; if you uncheck "All" and check one or more types
+   yourself, only those are exported. If you uncheck "All" and don't
+   check anything else either, "Custom selection" (checked by default)
+   decides the fallback: checked picks just the single busiest type,
+   unchecked exports every type (same as leaving "All" checked). Under
+   "Other options", there's also an "Export all instanced meshes"
+   checkbox (off by default) - see "Instanced draws" below. This is a
+   single static dialog - none of these checkboxes reprogram each other
+   live, since that (either directly, or via a button that closed and
+   reopened the dialog) turned out to crash RenderDoc.
+3. **Select passes** - a checkbox dialog lists each detected pass
+   matching your chosen draw call type(s) (`pass_00`, `pass_01`, ...)
+   along with its guessed role, draw count, and target counts, at most 20
+   per page (paginated if there are more). "Select All"/"Select None"
+   buttons are provided, all passes are checked by default, and closing
+   the dialog without pressing "Export Selected" cancels the whole export
    with nothing written to disk. Only the checked passes are actually
    exported (folders for unchecked passes are never created at all) -
    the real export then runs in the background, filtered to your
@@ -98,6 +142,12 @@ Both menu commands now run in two steps:
    (though replaying between two kept-but-distant events still has to
    process everything in between internally - that part is inherent
    replay cost, not something this extension controls).
+
+   Note: pagination and the "Select All"/"Select None" buttons all close
+   this dialog and open a freshly-built one with your selections carried
+   over, rather than updating the open dialog in place - directly
+   checking/unchecking widgets on an already-open dialog like this
+   crashes RenderDoc.
 
 #### Guessed pass roles
 
@@ -185,6 +235,17 @@ out which numbers correspond to what for a given game.
       the old behavior (unscaled, `e` assumed 1), so depth may still be
       off by an unknown-but-uniform factor. Check the `_posed.obj`
       file's header comment to see which case applied for a given draw.
+      The detected matrix is cached **per render pass**, not globally -
+      engines commonly reuse the same vertex shader across passes (e.g. a
+      shadow/depth prepass reusing the main pass's skinning shader with only
+      the pixel shader swapped) while binding a *different* view/projection
+      matrix per pass (light-space vs. camera-space). Caching by shader
+      alone would silently carry pass A's matrix into pass B's draws; this
+      is why the correction is scoped to the pass boundary instead. It does
+      **not** protect against the matrix changing between draws *within* the
+      same pass (e.g. a cubemap-face loop reusing one render target set with
+      six different view matrices per face) - check the recorded matrix (see
+      below) if depth still looks inconsistent within a single pass.
       In practice this heuristic hasn't reliably produced correct results
       even when it reports finding a matrix - treat posed-mesh depth for
       perspective draws as approximate, and prefer the object-space
@@ -223,16 +284,39 @@ out which numbers correspond to what for a given game.
         "name": "DrawIndexed(36)",
         "mesh": "meshes/eid123.obj",
         "posedMesh": "meshes_posed/eid123_posed.obj",
+        "posedSpace": "reconstructed view-space, perspective (exact units - projection matrix found in shader constants)",
+        "viewProjectionShader": "ResourceId::123456",
         "textures": [
           {"bindPoint": 0, "name": "g_DiffuseTex", "textureFile": "../textures/tex_45.png"}
         ]
       }
-    ]
+    ],
+    "viewProjections": {
+      "ResourceId::123456": {
+        "vertexShaderResourceId": "ResourceId::123456",
+        "constantBufferResourceId": "ResourceId::654321",
+        "eScale": 1.303,
+        "matrix": [1.303, 0.0, 0.0, 0.0, 0.0, 1.732, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, -0.1, 0.0]
+      }
+    }
   }
   ```
   `posedMesh` is `null` when posed export wasn't enabled, or when a
   draw's vertex shader had no usable position output. `textureFile` paths
   are relative to that pass's own `manifest.json`.
+
+  `posedSpace` records which case (see "Posed export" below) applied to
+  that draw's posed mesh, and `viewProjectionShader` (set only for the
+  perspective/exact-units case) points at the matching entry in this same
+  pass's `viewProjections` map, which holds the actual recovered
+  view/projection matrix and derived `eScale` - one entry per distinct
+  vertex shader resource seen in this pass, since the matrix is normally
+  constant across draws sharing a shader within one pass. Both fields are
+  absent where posed export wasn't enabled or produced nothing.
+  `viewProjections` only reflects draws in *this* pass folder - the same
+  vertex shader resource appearing in another pass's `manifest.json` may
+  (and often does) have a different matrix recorded there; see "Posed
+  export" below for why that pass boundary matters.
 
 ### Performance
 
@@ -333,9 +417,16 @@ doesn't crash or hang.
   Python shell (`Window > Python Shell`) with a capture loaded and
   inspect `dir(controller.GetPipelineState())` etc. to confirm exact
   names for your installed version.
-- Instanced draws: this exports one mesh per draw call using only
-  per-vertex attributes; any per-instance attribute (`perInstance` set on
-  the vertex input) is skipped entirely rather than expanded per instance.
+- Instanced draws: by default this exports one mesh per draw call using
+  only per-vertex attributes; any per-instance attribute (`perInstance`
+  set on the vertex input) is skipped entirely rather than expanded per
+  instance. Ticking "Export all instanced meshes" in the draw-call-types
+  popup additionally writes an `eid<N>_instances.json` sidecar next to
+  each instanced draw's base mesh, with the raw decoded per-instance
+  attribute values (e.g. a per-instance transform, color, or index) for
+  every instance actually drawn - it does not try to guess which
+  attribute(s) form a transform matrix, so interpreting them is left to
+  whatever consumes that file.
 - Pass splitting groups by exact render-target set (see "Pass splitting"
   above), so within a single actual pass, small target changes some
   engines do mid-pass (e.g. switching depth targets for a sub-portion of
@@ -345,7 +436,8 @@ doesn't crash or hang.
   (they were genuinely different render target sets), just more finely
   split than the "one folder per conceptual pass" ideal.
 - The pass-selection dialog is a plain vertical list of checkboxes with
-  no scroll area, built with `MiniQtHelper`. For a capture with a very
-  large number of distinct passes this could produce an awkwardly tall
-  window - it hasn't been tested against that case specifically.
+  no scroll area, built with `MiniQtHelper`. It's paginated at 20 passes
+  per page to keep the window from growing unboundedly tall, but each
+  page itself still isn't scrollable, so a capture with unusually many
+  passes sharing one page could still produce a tall window.
 
